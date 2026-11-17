@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Free Canvas</title>
+
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial,sans-serif;overflow:hidden;color:#333}
+header{
+ height:55px;background:#fff;border-bottom:1px solid #ddd;
+ display:flex;align-items:center;gap:6px;padding:7px;
+ overflow-x:auto;position:relative;z-index:10
+}
+button,select{
+ background:white;border:1px solid #ddd;border-radius:7px;
+ padding:8px 11px;cursor:pointer;white-space:nowrap
+}
+button:hover{background:#eeeaff}
+button.active{background:#e8e2ff;border-color:#9584e8}
+input[type=color]{width:32px;height:32px;border:0}
+#workspace{position:relative;width:100vw;height:calc(100vh - 55px);overflow:hidden;background:#fff}
+#objects{position:absolute;inset:0}
+.obj{position:absolute;touch-action:none;user-select:none}
+.obj.selected{outline:2px solid #7567d8;outline-offset:2px}
+.photo{min-width:30px;min-height:30px}
+.photo img{width:100%;height:100%;object-fit:fill;pointer-events:none;display:block}
+.txt{
+ min-width:40px;min-height:25px;padding:4px;
+ font-size:24px;white-space:pre-wrap;outline:none;
+ user-select:text;cursor:text
+}
+.handle{
+ position:absolute;width:12px;height:12px;border-radius:50%;
+ background:#7567d8;border:2px solid white;
+ display:none;z-index:5
+}
+.selected .handle{display:block}
+.handle.nw{left:-7px;top:-7px;cursor:nwse-resize}
+.handle.ne{right:-7px;top:-7px;cursor:nesw-resize}
+.handle.sw{left:-7px;bottom:-7px;cursor:nesw-resize}
+.handle.se{right:-7px;bottom:-7px;cursor:nwse-resize}
+.handle.rotate{
+ left:50%;top:-27px;transform:translateX(-50%);
+ cursor:grab;background:#e3a34c
+}
+#drawing{position:absolute;inset:0;width:100%;height:100%;overflow:visible;pointer-events:none}
+.stroke{fill:none;stroke-linecap:round;stroke-linejoin:round;pointer-events:stroke;cursor:pointer}
+.stroke.selected{filter:drop-shadow(0 0 2px #7567d8)}
+#drawing.active{pointer-events:auto;cursor:crosshair;touch-action:none}
+#pages{position:fixed;bottom:10px;left:50%;transform:translateX(-50%);z-index:10;background:#fff;padding:5px;border:1px solid #ddd;border-radius:10px;display:flex;gap:5px}
+#pages button{padding:5px 10px}
+</style>
+</head>
+
+<body>
+
+<header>
+ <button onclick="document.getElementById('files').click()">＋ 写真</button>
+ <input id="files" type="file" accept="image/*" multiple hidden>
+ <button onclick="addText()">T 文字</button>
+ <button id="penBtn" onclick="setTool('pen')">✎ ペン</button>
+ <button id="eraserBtn" onclick="setTool('eraser')">消しゴム</button>
+ <input type="color" id="color" value="#333333" title="色">
+ <select id="size">
+  <option value="2">細い</option>
+  <option value="4" selected>普通</option>
+  <option value="8">太い</option>
+  <option value="14">極太</option>
+ </select>
+ <button onclick="undo()">↶ 戻す</button>
+ <button onclick="redo()">↷ やり直す</button>
+ <button onclick="copyObject()">コピー</button>
+ <button onclick="pasteObject()">貼り付け</button>
+ <button onclick="deleteSelected()">削除</button>
+ <button onclick="changeBackground()">背景</button>
+ <input type="color" id="bgColor" value="#ffffff">
+ <button onclick="saveNow()">保存</button>
+ <button onclick="exportPNG()">PNG出力</button>
+</header>
+
+<div id="workspace">
+ <svg id="drawing"></svg>
+ <div id="objects"></div>
+</div>
+
+<div id="pages">
+ <button onclick="newPage()">＋ ページ</button>
+ <select id="pageSelect" onchange="switchPage(+this.value)"></select>
+</div>
+
+<script>
+const workspace=document.getElementById("workspace");
+const objects=document.getElementById("objects");
+const drawing=document.getElementById("drawing");
+
+let selected=null;
+let tool="select";
+let clipboardData=null;
+let pages=[{objects:[],strokes:[],background:"#ffffff"}];
+let pageIndex=0;
+let history=[];
+let historyIndex=-1;
+let drawingNow=false;
+let currentStroke=null;
+let points=[];
+let saveTimer;
+
+const uid=()=>Math.random().toString(36).slice(2,11);
+
+function snapshot(){
+ return JSON.stringify(getPageData());
+}
+
+function getPageData(){
+ return {
+  objects:[...objects.children].map(el=>({
+   id:el.dataset.id,type:el.dataset.type,
+   x:el.style.left,y:el.style.top,
+   w:el.style.width,h:el.style.height,
+   rotation:el.dataset.rotation||0,
+   content:el.dataset.type==="text"?el.innerText:null,
+   src:el.dataset.type==="photo"?el.querySelector("img").src:null,
+   color:el.style.color,fontSize:el.style.fontSize
+  })),
+  strokes:[...drawing.querySelectorAll(".stroke")].map(s=>({
+   d:s.getAttribute("d"),color:s.getAttribute("stroke"),
+   width:s.getAttribute("stroke-width"),id:s.dataset.id
+  })),
+  background:workspace.style.backgroundColor||"#ffffff"
+ };
+}
+
+function record(){
+ const state=snapshot();
+ if(history[historyIndex]===state)return;
+ history=history.slice(0,historyIndex+1);
+ history.push(state);
+ if(history.length>80)history.shift();
+ historyIndex=history.length-1;
+ scheduleSave();
+}
+
+function undo(){
+ if(historyIndex<=0)return;
+ historyIndex--;
+ restore(JSON.parse(history[historyIndex]));
+ scheduleSave();
+}
+
+function redo(){
+ if(historyIndex>=history.length-1)return;
+ historyIndex++;
+ restore(JSON.parse(history[historyIndex]));
+ scheduleSave();
+}
+
+function restore(data){
+ selected=null;
+ objects.innerHTML="";
+ drawing.innerHTML="";
+ workspace.style.backgroundColor=data.background||"#fff";
+
+ data.objects.forEach(o=>{
+  let el;
+  if(o.type==="photo")el=createPhoto(o.src,o.x,o.y,o.w,o.h,false);
+  else el=createText(o.content,o.x,o.y,false);
+  el.dataset.id=o.id;
+  el.dataset.rotation=o.rotation||0;
+  el.style.transform=`rotate(${o.rotation||0}deg)`;
+  if(o.color)el.style.color=o.color;
+  if(o.fontSize)el.style.fontSize=o.fontSize;
+ });
+
+ data.strokes.forEach(s=>createStroke(s.d,s.color,s.width,s.id,false));
+}
+
+function scheduleSave(){
+ clearTimeout(saveTimer);
+ saveTimer=setTimeout(saveNow,500);
+}
+
+function saveNow(){
+ try{
+  localStorage.setItem("freeCanvasPages",JSON.stringify(pages));
+  localStorage.setItem("freeCanvasCurrent",String(pageIndex));
+  localStorage.setItem("freeCanvasPageData",snapshot());
+ }catch(e){
+  console.warn("保存容量を超えました",e);
+ }
+}
+
+function loadSaved(){
+ try{
+  const saved=localStorage.getItem("freeCanvasPages");
+  const current=localStorage.getItem("freeCanvasCurrent");
+  if(saved){
+   pages=JSON.parse(saved);
+   pageIndex=Math.min(+current||0,pages.length-1);
+   restore(pages[pageIndex]);
+  }
+ }catch(e){}
+ history=[];
+ historyIndex=-1;
+ record();
+ updatePageSelect();
+}
+
+function updatePageSelect(){
+ const select=document.getElementById("pageSelect");
+ select.innerHTML="";
+ pages.forEach((p,i)=>{
+  const op=document.createElement("option");
+  op.value=i;op.textContent=`ページ ${i+1}`;
+  select.appendChild(op);
+ });
+ select.value=pageIndex;
+}
+
+function storePage(){
+ pages[pageIndex]=getPageData();
+}
+
+function newPage(){
+ storePage();
+ pages.push({objects:[],strokes:[],background:"#ffffff"});
+ pageIndex=pages.length-1;
+ restore(pages[pageIndex]);
+ history=[];historyIndex=-1;record();
+ updatePageSelect();
+}
+
+function switchPage(i){
+ storePage();
+ pageIndex=i;
+ restore(pages[i]);
+ history=[];historyIndex=-1;record();
+ updatePageSelect();
+}
+
+function deselect(){
+ document.querySelectorAll(".selected").forEach(el=>el.classList.remove("selected"));
+ selected=null;
+}
+
+function select(el){
+ deselect();
+ selected=el;
+ if(el)el.classList.add("selected");
+}
+
+function addHandles(el){
+ ["nw","ne","sw","se","rotate"].forEach(type=>{
+  const h=document.createElement("div");
+  h.className="handle "+type;
+  h.dataset.handle=type;
+  el.appendChild(h);
+  h.addEventListener("pointerdown",e=>{
+   e.stopPropagation();
+   e.preventDefault();
+   select(el);
+   if(type==="rotate")rotateObject(el,e);
+   else resizeObject(el,e,type);
+  });
+ });
+}
+
+function createPhoto(src,x=100,y=100,w=220,h=180,save=true){
+ const el=document.createElement("div");
+ el.className="obj photo";
+ el.dataset.type="photo";
+ el.dataset.id=uid();
+ el.style.left=parseFloat(x)+"px";
+ el.style.top=parseFloat(y)+"px";
+ el.style.width=parseFloat(w)+"px";
+ el.style.height=parseFloat(h)+"px";
+
+ const img=document.createElement("img");
+ img.src=src;
+ el.appendChild(img);
+ addHandles(el);
+ objects.appendChild(el);
+ wireObject(el);
+ if(save)record();
+ return el;
+}
+
+function createText(text="文字を入力",x=120,y=120,save=true){
+ const el=document.createElement("div");
+ el.className="obj txt";
+ el.dataset.type="text";
+ el.dataset.id=uid();
+ el.contentEditable="true";
+ el.innerText=text;
+ el.style.left=parseFloat(x)+"px";
+ el.style.top=parseFloat(y)+"px";
+ el.style.color="#333";
+ el.style.fontSize="24px";
+ addHandles(el);
+ objects.appendChild(el);
+ wireObject(el);
+ el.addEventListener("input",()=>scheduleSave());
+ el.addEventListener("blur",()=>record());
+ if(save)record();
+ return el;
+}
+
+function addText(){
+ const el=createText();
+ select(el);
+ el.focus();
+}
+
+function wireObject(el){
+ let startX,startY,startLeft,startTop,moved=false;
+
+ el.addEventListener("pointerdown",e=>{
+  if(e.target.classList.contains("handle"))return;
+  if(tool!=="select")return;
+  if(e.target.isContentEditable){
+   select(el);
+   return;
+  }
+  e.preventDefault();
+  select(el);
+  startX=e.clientX;
+  startY=e.clientY;
+  startLeft=el.offsetLeft;
+  startTop=el.offsetTop;
+  moved=false;
+  el.setPointerCapture(e.pointerId);
+ });
+
+ el.addEventListener("pointermove",e=>{
+  if(!el.hasPointerCapture(e.pointerId))return;
+  const dx=e.clientX-startX,dy=e.clientY-startY;
+  if(Math.abs(dx)+Math.abs(dy)>2)moved=true;
+  el.style.left=startLeft+dx+"px";
+  el.style.top=startTop+dy+"px";
+ });
+
+ el.addEventListener("pointerup",e=>{
+  if(el.hasPointerCapture(e.pointerId)){
+   el.releasePointerCapture(e.pointerId);
+   if(moved)record();
+  }
+ });
+}
+
+function resizeObject(el,e,type){
+ const startX=e.clientX,startY=e.clientY;
+ const startW=el.offsetWidth,startH=el.offsetHeight;
+ const startL=el.offsetLeft,startT=el.offsetTop;
+ const ratio=startW/startH;
+
+ function move(ev){
+  let dx=ev.clientX-startX,dy=ev.clientY-startY;
+  let w=startW,h=startH;
+
+  if(type.includes("e"))w=startW+dx;
+  if(type.includes("w"))w=startW-dx;
+  if(type.includes("s"))h=startH+dy;
+  if(type.includes("n"))h=startH-dy;
+
+  if(ev.shiftKey){
+   h=w/ratio;
+  }
+
+  w=Math.max(25,w);
+  h=Math.max(25,h);
+
+  el.style.width=w+"px";
+  el.style.height=h+"px";
+
+  if(type.includes("w"))el.style.left=startL+startW-w+"px";
+  if(type.includes("n"))el.style.top=startT+startH-h+"px";
+ }
+
+ function up(){
+  window.removeEventListener("pointermove",move);
+  window.removeEventListener("pointerup",up);
+  record();
+ }
+
+ window.addEventListener("pointermove",move);
+ window.addEventListener("pointerup",up);
+}
+
+function rotateObject(el,e){
+ const rect=el.getBoundingClientRect();
+ const cx=rect.left+rect.width/2;
+ const cy=rect.top+rect.height/2;
+
+ function move(ev){
+  const angle=Math.atan2(ev.clientY-cy,ev.clientX-cx)*180/Math.PI+90;
+  el.dataset.rotation=angle;
+  el.style.transform=`rotate(${angle}deg)`;
+ }
+
+ function up(){
+  window.removeEventListener("pointermove",move);
+  window.removeEventListener("pointerup",up);
+  record();
+ }
+
+ window.addEventListener("pointermove",move);
+ window.addEventListener("pointerup",up);
+}
+
+// ファイルから写真
+document.getElementById("files").onchange=e=>{
+ [...e.target.files].forEach(file=>{
+  const reader=new FileReader();
+  reader.onload=()=>{
+   const el=createPhoto(reader.result);
+   select(el);
+  };
+  reader.readAsDataURL(file);
+ });
+ e.target.value="";
+};
+
+// 写真のコピー・貼り付け
+function copyObject(){
+ if(!selected)return;
+ clipboardData={
+  type:selected.dataset.type,
+  content:selected.dataset.type==="text"?selected.innerText:null,
+  src:selected.dataset.type==="photo"?selected.querySelector("img").src:null,
+  w:selected.offsetWidth,h:selected.offsetHeight,
+  color:selected.style.color,fontSize:selected.style.fontSize
+ };
+}
+
+function pasteObject(){
+ if(!clipboardData)return;
+ let el;
+ if(clipboardData.type==="photo"){
+  el=createPhoto(clipboardData.src,130,130,clipboardData.w,clipboardData.h);
+ }else{
+  el=createText(clipboardData.content,140,140);
+  el.style.color=clipboardData.color;
+  el.style.fontSize=clipboardData.fontSize;
+ }
+ select(el);
+}
+
+function deleteSelected(){
+ if(!selected)return;
+ selected.remove();
+ selected=null;
+ record();
+}
+
+// ペン・消しゴム
+function setTool(t){
+ tool=tool===t?"select":t;
+ drawing.classList.toggle("active",tool==="pen"||tool==="eraser");
+ document.getElementById("penBtn").classList.toggle("active",tool==="pen");
+ document.getElementById("eraserBtn").classList.toggle("active",tool==="eraser");
+ deselect();
+}
+
+function createStroke(d,color,width,id=uid(),save=true){
+ const path=document.createElementNS("http://www.w3.org/2000/svg","path");
+ path.setAttribute("d",d);
+ path.setAttribute("stroke",color);
+ path.setAttribute("stroke-width",width);
+ path.setAttribute("class","stroke");
+ path.dataset.id=id;
+ drawing.appendChild(path);
+ path.addEventListener("pointerdown",e=>{
+  if(tool!=="select")return;
+  e.stopPropagation();
+  select(path);
+ });
+ if(save)record();
+ return path;
+}
+
+function pointerPos(e){
+ const r=drawing.getBoundingClientRect();
+ return [e.clientX-r.left,e.clientY-r.top];
+}
+
+drawing.addEventListener("pointerdown",e=>{
+ if(tool!=="pen"&&tool!=="eraser")return;
+ drawingNow=true;
+ drawing.setPointerCapture(e.pointerId);
+ const [x,y]=pointerPos(e);
+ points=[[x,y]];
+
+ if(tool==="pen"){
+  currentStroke=createStroke(`M ${x} ${y}` ,document.getElementById("color").value,document.getElementById("size").value,uid(),false);
+ }
+});
+
+drawing.addEventListener("pointermove",e=>{
+ if(!drawingNow)return;
+ const [x,y]=pointerPos(e);
+
+ if(tool==="pen"){
+  points.push([x,y]);
+  currentStroke.setAttribute("d",points.map((p,i)=>(i?"L ":"M ")+p[0]+" "+p[1]).join(" "));
+ }
+
+ if(tool==="eraser"){
+  const target=document.elementFromPoint(e.clientX,e.clientY);
+  if(target?.classList.contains("stroke")){
+   target.remove();
+  }
+ }
+});
+
+drawing.addEventListener("pointerup",()=>{
+ if(!drawingNow)return;
+ drawingNow=false;
+ if(tool==="pen"&&currentStroke)record();
+ if(tool==="eraser")record();
+ currentStroke=null;
+});
+
+// 背景色
+function changeBackground(){
+ workspace.style.backgroundColor=document.getElementById("bgColor").value;
+ record();
+}
+
+// 外側クリックで選択解除
+workspace.addEventListener("pointerdown",e=>{
+ if(e.target===workspace)deselect();
+});
+
+// キーボード操作
+document.addEventListener("keydown",e=>{
+ const editing=e.target.isContentEditable;
+ if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="z"){
+  e.preventDefault();undo();
+ }
+ if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="y"){
+  e.preventDefault();redo();
+ }
+ if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="c"&&!editing){
+  copyObject();e.preventDefault();
+ }
+ if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="v"&&!editing){
+  e.preventDefault();pasteObject();
+ }
+ if(e.key==="Delete"&&!editing)deleteSelected();
+ if(e.key==="Escape"){deselect();setTool("select");}
+});
+
+// OSから画像をペースト
+document.addEventListener("paste",e=>{
+ const item=[...e.clipboardData.items].find(i=>i.type.startsWith("image/"));
+ if(!item)return;
+ const reader=new FileReader();
+ reader.onload=()=>createPhoto(reader.result);
+ reader.readAsDataURL(item.getAsFile());
+});
+
+// PNG出力
+async function exportPNG(){
+ const canvas=document.createElement("canvas");
+ canvas.width=workspace.clientWidth*2;
+ canvas.height=workspace.clientHeight*2;
+ const ctx=canvas.getContext("2d");
+ ctx.scale(2,2);
+ ctx.fillStyle=getComputedStyle(workspace).backgroundColor;
+ ctx.fillRect(0,0,workspace.clientWidth,workspace.clientHeight);
+
+ for(const el of objects.children){
+  const x=el.offsetLeft,y=el.offsetTop;
+  ctx.save();
+  ctx.translate(x+el.offsetWidth/2,y+el.offsetHeight/2);
+  ctx.rotate((+(el.dataset.rotation||0))*Math.PI/180);
+  if(el.dataset.type==="photo"){
+   const img=new Image();
+   img.src=el.querySelector("img").src;
+   await new Promise(r=>{img.onload=r;img.onerror=r});
+   ctx.drawImage(img,-el.offsetWidth/2,-el.offsetHeight/2,el.offsetWidth,el.offsetHeight);
+  }else{
+   ctx.fillStyle=getComputedStyle(el).color;
+   ctx.font=`${getComputedStyle(el).fontSize} sans-serif`;
+   el.innerText.split("\n").forEach((line,i)=>{
+    ctx.fillText(line,-el.offsetWidth/2+4,-el.offsetHeight/2+25+i*30);
+   });
+  }
+  ctx.restore();
+ }
+
+ const svgData=new XMLSerializer().serializeToString(drawing);
+ const blob=new Blob([svgData],{type:"image/svg+xml"});
+ const url=URL.createObjectURL(blob);
+ const img=new Image();
+ img.src=url;
+ await new Promise(r=>{img.onload=r;img.onerror=r});
+ ctx.drawImage(img,0,0,workspace.clientWidth,workspace.clientHeight);
+ URL.revokeObjectURL(url);
+
+ const a=document.createElement("a");
+ a.download="free-canvas.png";
+ a.href=canvas.toDataURL("image/png");
+ a.click();
+}
+
+loadSaved();
+</script>
+</body>
+</html>
